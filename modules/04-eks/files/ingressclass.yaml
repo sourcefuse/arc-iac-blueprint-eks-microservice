@@ -1,0 +1,16 @@
+# EKS Auto Mode ALB IngressClass. Named "alb" and marked default so the SAME
+# app/dashboard Ingresses (ingressClassName: alb) work unchanged — the only
+# difference vs classic mode is the controller: Auto Mode's built-in
+# eks.amazonaws.com/alb instead of the self-managed AWS LB Controller.
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: alb
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: eks.amazonaws.com/alb
+  parameters:
+    apiGroup: eks.amazonaws.com
+    kind: IngressClassParams
+    name: alb

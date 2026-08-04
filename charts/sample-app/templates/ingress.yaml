@@ -1,0 +1,41 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sample-app
+  labels:
+    {{- include "sample-app.labels" . | nindent 4 }}
+  annotations:
+    # Provisioned by the AWS Load Balancer Controller (installed by modules/04-eks).
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    # ONE shared ALB across app + ArgoCD + SigNoz is configured at the IngressClass
+    # level (04-eks) for both modes — no per-Ingress group.name needed here.
+    alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.ingress.healthcheckPath }}
+    # The WAF Web ACL is attached to the shared ALB by 08-waf (declarative TF
+    # association) — Auto Mode's controller ignores the wafv2-acl-arn annotation.
+    {{- if .Values.ingress.certArn }}
+    # HTTPS on the custom domain + HTTP->HTTPS redirect.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.certArn }}
+    {{- else }}
+    # No ACM cert resolved — plain HTTP on :80 at the raw ALB DNS.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sample-app
+                port:
+                  number: {{ .Values.service.port }}
+      {{- if .Values.ingress.host }}
+      host: {{ .Values.ingress.host }}
+      {{- end }}
+{{- end }}

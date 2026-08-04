@@ -1,0 +1,1025 @@
+# =============================================================================
+# Create EKS Microservices Blueprint Infrastructure
+# =============================================================================
+# Manually-triggered deploy of the full blueprint. Each modules/NN-name/ is an
+# independent Terraform root with its own S3 backend (backend/config.<env>.hcl)
+# and its own tfvars (tfvars/<env>.tfvars). Cross-layer values are resolved via
+# data sources (VPC/subnets by tag), so job ordering here follows the real
+# dependency DAG:
+#
+#   network ─┬─ eks (cluster + add-ons) ─┬─ observability
+#            │                           ├─ argocd (control plane)
+#            │                           └─ deploy-sample
+#            ├─ vpn (client VPN → private EKS API access)
+#            ├─ aurora
+#            └─ cache
+#   ecr ── build-sample ── deploy-sample
+# (deploy-sample re-applies 10-argocd with the built image + resolved endpoints
+#  to declare an ArgoCD Application → ArgoCD renders charts/sample-app and syncs
+#  it, then the job associates the WAF, points DNS at the ALB, and prints the URL.)
+# (Security groups are provisioned per-module by arc-db/arc-cache/arc-eks; the
+#  add-ons are folded into the eks layer — no separate security-group/eks-addon.)
+#
+# The backend bucket + lock table are resolved from the SSM parameter written by
+# bootstrap (/<namespace>/<env>/terraform/backend-config), so bootstrap only
+# needs to run on the first deploy (tick run_bootstrap).
+# =============================================================================
+name: Create EKS Blueprint Infrastructure
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment (dev, staging, prod)
+        required: true
+        default: dev
+      region:
+        description: AWS region
+        required: true
+        default: us-east-1
+      compliance_profile:
+        description: Compliance profile (general, hipaa, pci_dss)
+        required: true
+        default: general
+      run_bootstrap:
+        description: Run bootstrap to create the state backend (first deploy only)
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: create-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: ${{ vars.TERRAFORM_VERSION || '1.9.8' }}
+  NAMESPACE: ${{ vars.NAMESPACE || 'eksblueprint-arc' }}
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+  AWS_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
+  # Custom domain. The public UI is served by CloudFront + S3 at
+  # <APP_SUBDOMAIN>.<HOSTED_ZONE> (e.g. eksbp.arc-poc.link); the EKS backend API
+  # is served by the ALB at <APP_SUBDOMAIN>-api.<HOSTED_ZONE> (e.g.
+  # eksbp-api.arc-poc.link). Requires a Route53 hosted zone for HOSTED_ZONE and an
+  # ACM cert (us-east-1) covering *.HOSTED_ZONE. If no cert is found the API is
+  # still served on plain HTTP at the raw ALB DNS name.
+  HOSTED_ZONE: ${{ vars.HOSTED_ZONE || 'arc-poc.link' }}
+  APP_SUBDOMAIN: ${{ vars.APP_SUBDOMAIN || 'eksbp' }}
+  # Serialize Terraform's AWS API calls. On the self-hosted runner (and other
+  # environments) parallel provider requests intermittently corrupt each other
+  # on the wire -> "InvalidHttpRequest: Unable to parse request" / garbled API
+  # errors. -parallelism=1 avoids the concurrency and makes runs reliable.
+  TF_CLI_ARGS_apply: "-parallelism=1"
+  TF_CLI_ARGS_plan: "-parallelism=1"
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # 1. Bootstrap — S3 state bucket + DynamoDB lock table
+  # ---------------------------------------------------------------------------
+  bootstrap:
+    name: Bootstrap
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event.inputs.run_bootstrap == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-bootstrap
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: bootstrap
+        run: terraform init
+      - name: Apply
+        working-directory: bootstrap
+        run: |
+          terraform apply -auto-approve \
+            -var="namespace=${{ env.NAMESPACE }}" \
+            -var="environment=${{ env.ENVIRONMENT }}" \
+            -var="region=${{ env.AWS_REGION }}"
+
+  # ---------------------------------------------------------------------------
+  # 2. Resolve Backend — bucket/table from the bootstrap SSM parameter
+  # ---------------------------------------------------------------------------
+  resolve-backend:
+    name: Resolve Backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [bootstrap]
+    if: always() && !failure() && !cancelled()
+    outputs:
+      state_bucket: ${{ steps.resolve.outputs.state_bucket }}
+      lock_table: ${{ steps.resolve.outputs.lock_table }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: resolve-backend-${{ env.ENVIRONMENT }}
+      - name: Resolve from SSM backend-config
+        id: resolve
+        run: |
+          PARAM=$(aws ssm get-parameter \
+            --name "/${{ env.NAMESPACE }}/${{ env.ENVIRONMENT }}/terraform/backend-config" \
+            --query "Parameter.Value" --output text)
+          BUCKET=$(echo "$PARAM" | python3 -c "import sys,json;print(json.load(sys.stdin)['bucket_name'])")
+          TABLE=$(echo "$PARAM" | python3 -c "import sys,json;print(json.load(sys.stdin)['dynamodb_name'])")
+          echo "state_bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "lock_table=$TABLE" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 3. 01-network — VPC, public/private subnets, regional NAT
+  # ---------------------------------------------------------------------------
+  network:
+    name: 01-network
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [resolve-backend]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-network
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: modules/01-network
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/01-network
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+      - name: Apply
+        working-directory: modules/01-network
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+
+  # ---------------------------------------------------------------------------
+  # 4. 02-vpn — AWS Client VPN (mutual TLS) for private EKS API / internal access.
+  #    Pure AWS API (ACM + SSM + EC2 Client VPN), so it runs on a GitHub-hosted
+  #    runner. Depends only on the VPC/private subnets from 01-network.
+  # ---------------------------------------------------------------------------
+  vpn:
+    name: 02-vpn
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [resolve-backend, network]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-vpn
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: modules/02-vpn
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/02-vpn
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+      - name: Apply
+        working-directory: modules/02-vpn
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+
+  # ---------------------------------------------------------------------------
+  # 5. 03-github-runner — self-hosted EC2 runner in a PRIVATE subnet of the VPC.
+  #    The cluster-touching jobs below run on it (runs-on: [self-hosted, eb]) so
+  #    they can reach the private-only EKS API. Applied here on a GitHub-hosted
+  #    runner (pure AWS API). Requires a repo secret GH_RUNNER_PAT (PAT, repo
+  #    scope) so the module can register the runner.
+  # ---------------------------------------------------------------------------
+  github-runner:
+    name: 03-github-runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [resolve-backend, network]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-runner
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: modules/03-github-runner
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/03-github-runner
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_github_token: ${{ secrets.GH_RUNNER_PAT }}
+          # Register the runner against the repo running this pipeline (owner/repo),
+          # so it works in any repo/fork without editing the variables.tf default.
+          TF_VAR_github_owner: ${{ github.repository }}
+      - name: Apply
+        working-directory: modules/03-github-runner
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_github_token: ${{ secrets.GH_RUNNER_PAT }}
+          # Register the runner against the repo running this pipeline (owner/repo),
+          # so it works in any repo/fork without editing the variables.tf default.
+          TF_VAR_github_owner: ${{ github.repository }}
+
+  # ---------------------------------------------------------------------------
+  # 6. 04-eks — EKS cluster + managed node groups + add-ons
+  #    (security groups are provisioned per-module by arc-db / arc-cache / arc-eks;
+  #     the standalone 03-security-group layer was removed as redundant.)
+  #    (security groups are provisioned per-module by arc-db / arc-cache / arc-eks;
+  #     the standalone 03-security-group layer was removed as redundant.)
+  # ---------------------------------------------------------------------------
+  eks:
+    name: 04-eks
+    # Runs on the in-VPC ephemeral runner — it applies the cluster AND kubectl/
+    # helm add-ons against the PRIVATE API endpoint.
+    runs-on: [self-hosted, eb]
+    timeout-minutes: 60
+    needs: [resolve-backend, network, github-runner]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-eks
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: modules/04-eks
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/04-eks
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          # Grant this CI role cluster-admin (EKS access entry) so the folded
+          # add-ons and deploy-sample can reach the Kubernetes API.
+          TF_VAR_ci_admin_role_arn: ${{ secrets.AWS_ROLE_ARN }}
+      - name: Apply
+        working-directory: modules/04-eks
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          # Grant this CI role cluster-admin (EKS access entry) so the folded
+          # add-ons and deploy-sample can reach the Kubernetes API.
+          TF_VAR_ci_admin_role_arn: ${{ secrets.AWS_ROLE_ARN }}
+
+  # ---------------------------------------------------------------------------
+  # 6b. 09-observability — Prometheus + Grafana (arc-observability-stack)
+  # ---------------------------------------------------------------------------
+  # Metrics stack on the existing cluster. Needs eks (add-ons are now folded into
+  # the 04-eks layer; gp3 StorageClass backs the Prometheus PersistentVolume).
+  observability:
+    name: 09-observability
+    runs-on: [self-hosted, eb]
+    timeout-minutes: 30
+    needs: [resolve-backend, eks, github-runner]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-observability
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      # Wildcard ACM cert (us-east-1) for the dashboard UIs; empty => HTTP only.
+      - name: Resolve ACM cert
+        id: cert
+        run: |
+          CERT=$(aws acm list-certificates --region "${AWS_REGION}" --certificate-statuses ISSUED \
+            --query "CertificateSummaryList[?DomainName=='*.${HOSTED_ZONE}' || DomainName=='${HOSTED_ZONE}'].CertificateArn | [0]" --output text 2>/dev/null || true)
+          [ "$CERT" = "None" ] && CERT=""
+          echo "cert=$CERT" >> "$GITHUB_OUTPUT"
+      - name: Init
+        working-directory: modules/09-observability
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/09-observability
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          # Dashboard UI ingress on the shared ALB (module-owned). The module only
+          # exposes the active backend's UI (SigNoz or Grafana), so both are on.
+          TF_VAR_signoz_expose_ui: "true"
+          TF_VAR_signoz_host: ekssg.${{ env.HOSTED_ZONE }}
+          TF_VAR_grafana_expose_ui: "true"
+          TF_VAR_grafana_host: eksgf.${{ env.HOSTED_ZONE }}
+          TF_VAR_dashboard_cert_arn: ${{ steps.cert.outputs.cert }}
+      - name: Apply
+        working-directory: modules/09-observability
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_signoz_expose_ui: "true"
+          TF_VAR_signoz_host: ekssg.${{ env.HOSTED_ZONE }}
+          TF_VAR_grafana_expose_ui: "true"
+          TF_VAR_grafana_host: eksgf.${{ env.HOSTED_ZONE }}
+          TF_VAR_dashboard_cert_arn: ${{ steps.cert.outputs.cert }}
+
+  # ---------------------------------------------------------------------------
+  # 7c. 10-argocd — ArgoCD GitOps (arc-argocd)
+  # ---------------------------------------------------------------------------
+  argocd:
+    name: 10-argocd
+    runs-on: [self-hosted, eb]
+    timeout-minutes: 30
+    needs: [resolve-backend, eks, github-runner]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-argocd
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      # Wildcard ACM cert (us-east-1) for the ArgoCD UI; empty => HTTP only.
+      - name: Resolve ACM cert
+        id: cert
+        run: |
+          CERT=$(aws acm list-certificates --region "${AWS_REGION}" --certificate-statuses ISSUED \
+            --query "CertificateSummaryList[?DomainName=='*.${HOSTED_ZONE}' || DomainName=='${HOSTED_ZONE}'].CertificateArn | [0]" --output text 2>/dev/null || true)
+          [ "$CERT" = "None" ] && CERT=""
+          echo "cert=$CERT" >> "$GITHUB_OUTPUT"
+      - name: Init
+        working-directory: modules/10-argocd
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/10-argocd
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          # ArgoCD UI ingress on the shared ALB (module-owned) + Route53 record.
+          TF_VAR_expose_argocd: "true"
+          TF_VAR_argocd_host: eksag.${{ env.HOSTED_ZONE }}
+          TF_VAR_argocd_cert_arn: ${{ steps.cert.outputs.cert }}
+      - name: Apply
+        working-directory: modules/10-argocd
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_expose_argocd: "true"
+          TF_VAR_argocd_host: eksag.${{ env.HOSTED_ZONE }}
+          TF_VAR_argocd_cert_arn: ${{ steps.cert.outputs.cert }}
+
+  # ---------------------------------------------------------------------------
+  # 7d. route53-records — point DNS at the shared ALB for each dashboard UI.
+  #     The ingresses are module-owned (10-argocd / 09-observability), but their
+  #     module DNS races ALB provisioning. This step WAITS for each ingress's ALB
+  #     hostname, then UPSERTs a CNAME — deterministic. (App DNS stays in
+  #     deploy-sample; all three share the one ALB.)
+  # ---------------------------------------------------------------------------
+  route53-records:
+    name: route53-records
+    runs-on: [self-hosted, eb]
+    timeout-minutes: 20
+    needs: [resolve-backend, eks, github-runner, argocd, observability]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-route53
+      - name: UPSERT dashboard CNAMEs -> shared ALB
+        run: |
+          TFV="modules/04-eks/tfvars/${{ env.ENVIRONMENT }}.tfvars"
+          NS=$(grep -E '^namespace'   "$TFV" | head -1 | sed 's/.*=//; s/[" ]//g')
+          EN=$(grep -E '^environment' "$TFV" | head -1 | sed 's/.*=//; s/[" ]//g')
+          CLUSTER="${NS}-${EN}-eks"
+          aws eks update-kubeconfig --region "${{ env.AWS_REGION }}" --name "$CLUSTER" \
+            || { echo "cluster not reachable — skipping DNS"; exit 0; }
+          ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "${HOSTED_ZONE}" \
+            --query "HostedZones[?Name=='${HOSTED_ZONE}.'].Id | [0]" --output text 2>/dev/null | sed 's#/hostedzone/##' || true)
+          if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "None" ]; then
+            echo "hosted zone ${HOSTED_ZONE} not found — skipping dashboard DNS"; exit 0
+          fi
+          {
+            echo "## Dashboard URLs"
+            # <ingress name>:<namespace>:<subdomain> — only the active backend's
+            # metrics ingress exists (SigNoz or Grafana), so inactive ones skip.
+            for triple in "argocd-server:argocd:eksag" "signoz:signoz:ekssg" "grafana:metrics:eksgf"; do
+              name="${triple%%:*}"; rest="${triple#*:}"; ns="${rest%%:*}"; sub="${rest##*:}"
+              kubectl -n "$ns" get ingress "$name" >/dev/null 2>&1 || continue
+              ALB=""
+              for i in $(seq 1 40); do
+                ALB=$(kubectl -n "$ns" get ingress "$name" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+                [ -n "$ALB" ] && break
+                echo "waiting for ${sub} ALB hostname... ($i)" >&2; sleep 15
+              done
+              if [ -z "$ALB" ]; then echo "- **${sub}**: ALB not ready — \`kubectl get ingress ${name} -n ${ns}\`"; continue; fi
+              HOST="${sub}.${HOSTED_ZONE}"
+              BATCH=$(printf '{"Comment":"%s","Changes":[{"Action":"UPSERT","ResourceRecordSet":{"Name":"%s","Type":"CNAME","TTL":300,"ResourceRecords":[{"Value":"%s"}]}}]}' "$sub" "$HOST" "$ALB")
+              if aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" --change-batch "$BATCH" >/dev/null 2>&1; then
+                echo "- **https://${HOST}** — DNS record created"
+              else
+                echo "- **https://${HOST}** — add CNAME manually -> \`${ALB}\` (CI role lacks route53 perms)"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 8. 05-ecr — container image registry
+  # ---------------------------------------------------------------------------
+  ecr:
+    name: 05-ecr
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [resolve-backend]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-ecr
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: modules/05-ecr
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/05-ecr
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+      - name: Apply
+        working-directory: modules/05-ecr
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+
+  # ---------------------------------------------------------------------------
+  # 9. 06-aurora — Aurora PostgreSQL cluster
+  # ---------------------------------------------------------------------------
+  aurora:
+    name: 06-aurora
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [resolve-backend, network]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-db
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: modules/06-aurora
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/06-aurora
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+      - name: Apply
+        working-directory: modules/06-aurora
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+
+  # ---------------------------------------------------------------------------
+  # 10. 07-cache — ElastiCache Redis
+  # ---------------------------------------------------------------------------
+  cache:
+    name: 07-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [resolve-backend, network]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-cache
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: modules/07-cache
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/07-cache
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+      - name: Apply
+        working-directory: modules/07-cache
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+
+  # ---------------------------------------------------------------------------
+  # 12. 08-waf — CLOUDFRONT-scope Web ACL (us-east-1) for the frontend CDN.
+  #     Serves the public UI is via CloudFront + S3, so WAF is applied at the edge
+  #     (attached by 12-cloudfront via web_acl_id), NOT on the ALB. It no longer
+  #     looks up the ALB, so it runs early (only needs the backend state) and the
+  #     cloudfront job depends on it. Mirrors the ECS blueprint.
+  # ---------------------------------------------------------------------------
+  waf:
+    name: 08-waf
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [resolve-backend]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # CLOUDFRONT-scope WAF lives in us-east-1.
+          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-waf
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: modules/08-waf
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/08-waf
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: us-east-1
+      - name: Apply
+        working-directory: modules/08-waf
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: us-east-1
+
+  # ---------------------------------------------------------------------------
+  # 12b. 11-s3 — private bucket for the static frontend (SPA) + CloudFront origin.
+  # ---------------------------------------------------------------------------
+  s3:
+    name: 11-s3
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [resolve-backend]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-s3
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: modules/11-s3
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Plan
+        working-directory: modules/11-s3
+        run: terraform plan -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+      - name: Apply
+        working-directory: modules/11-s3
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+
+  # ---------------------------------------------------------------------------
+  # 12c. 12-cloudfront — CloudFront distribution serving the SPA (WAF at the edge).
+  #      Needs the CLOUDFRONT WAF (waf) and the origin bucket (s3). The UI host +
+  #      root domain come from APP_SUBDOMAIN / HOSTED_ZONE.
+  # ---------------------------------------------------------------------------
+  cloudfront:
+    name: 12-cloudfront
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [resolve-backend, waf, s3]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: tf-${{ env.ENVIRONMENT }}-cloudfront
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: modules/12-cloudfront
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}"
+      - name: Apply
+        working-directory: modules/12-cloudfront
+        run: terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          # Frontend URL = <APP_SUBDOMAIN>.<HOSTED_ZONE>, e.g. eksbp.arc-poc.link.
+          TF_VAR_root_domain: ${{ env.HOSTED_ZONE }}
+          TF_VAR_ui_host: ${{ env.APP_SUBDOMAIN }}.${{ env.HOSTED_ZONE }}
+
+  # ---------------------------------------------------------------------------
+  # 12d. deploy-frontend — publish the SPA to S3 + invalidate CloudFront.
+  #      Injects the backend API base (<APP_SUBDOMAIN>-api.<HOSTED_ZONE>) into
+  #      index.html, syncs sample-app/frontend/ to the 11-s3 bucket, then invalidates.
+  # ---------------------------------------------------------------------------
+  deploy-frontend:
+    name: Deploy Frontend → S3
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [resolve-backend, s3, cloudfront]
+    if: always() && !failure() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: frontend-deploy-${{ env.ENVIRONMENT }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Resolve frontend bucket + CloudFront distribution
+        id: cfg
+        env:
+          BUCKET_STATE: ${{ needs.resolve-backend.outputs.state_bucket }}
+          TABLE: ${{ needs.resolve-backend.outputs.lock_table }}
+        run: |
+          # Bucket name straight from the 11-s3 Terraform output (avoids guessing
+          # the namespace, which differs from the pipeline NAMESPACE).
+          terraform -chdir=modules/11-s3 init -reconfigure \
+            -backend-config="backend/config.${{ env.ENVIRONMENT }}.hcl" \
+            -backend-config="bucket=$BUCKET_STATE" \
+            -backend-config="dynamodb_table=$TABLE" >/dev/null
+          BUCKET=$(terraform -chdir=modules/11-s3 output -raw bucket_id)
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          # Distribution id by its alias (the UI host).
+          UI_HOST="${APP_SUBDOMAIN}.${HOSTED_ZONE}"
+          DIST_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Aliases.Items && contains(Aliases.Items, '${UI_HOST}')].Id | [0]" \
+            --output text 2>/dev/null || true)
+          echo "dist_id=$DIST_ID" >> "$GITHUB_OUTPUT"
+      - name: Inject backend API base into index.html
+        run: |
+          API_BASE="https://${APP_SUBDOMAIN}-api.${HOSTED_ZONE}"
+          sed -i "s#__API_BASE__#${API_BASE}#g" sample-app/frontend/index.html
+          echo "API base -> ${API_BASE}"
+      - name: Sync frontend to S3
+        run: |
+          # Static assets: long cache. HTML: no-cache so users get the latest index.
+          aws s3 sync sample-app/frontend/ "s3://${{ steps.cfg.outputs.bucket }}/" \
+            --delete --exclude "*.html" \
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 sync sample-app/frontend/ "s3://${{ steps.cfg.outputs.bucket }}/" \
+            --exclude "*" --include "*.html" \
+            --cache-control "no-cache, no-store, must-revalidate"
+      - name: Invalidate CloudFront cache
+        if: steps.cfg.outputs.dist_id != 'None' && steps.cfg.outputs.dist_id != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.cfg.outputs.dist_id }}" --paths "/*"
+      - name: Print frontend URL
+        run: |
+          echo "## Frontend deployed (CloudFront + S3)" >> "$GITHUB_STEP_SUMMARY"
+          echo "**UI:** https://${APP_SUBDOMAIN}.${HOSTED_ZONE}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Backend API:** https://${APP_SUBDOMAIN}-api.${HOSTED_ZONE}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 13. build-sample — build & push the app image to ECR
+  # ---------------------------------------------------------------------------
+  build-sample:
+    name: Build & Push Sample Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [resolve-backend, ecr]
+    if: always() && !failure() && !cancelled()
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: ecr-push-${{ env.ENVIRONMENT }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Resolve ECR repository URL from Terraform state
+        id: ecr
+        working-directory: modules/05-ecr
+        run: |
+          terraform init -reconfigure \
+            -backend-config=backend/config.${{ env.ENVIRONMENT }}.hcl \
+            -backend-config="bucket=${{ needs.resolve-backend.outputs.state_bucket }}" \
+            -backend-config="dynamodb_table=${{ needs.resolve-backend.outputs.lock_table }}" >/dev/null
+          echo "url=$(terraform output -raw repository_url)" >> "$GITHUB_OUTPUT"
+      - name: ECR login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build, tag & push
+        id: push
+        working-directory: sample-app
+        env:
+          ECR_URL: ${{ steps.ecr.outputs.url }}
+        run: |
+          # The ECR repo uses immutable tags, so push only the unique timestamp
+          # tag (never a re-usable ':latest', which would fail on the 2nd run).
+          # deploy-sample consumes this exact immutable tag via the job output.
+          TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
+          docker build --platform linux/amd64 -t "$ECR_URL:$TIMESTAMP" .
+          docker push "$ECR_URL:$TIMESTAMP"
+          echo "image=$ECR_URL:$TIMESTAMP" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 15. deploy-sample — declare the app as an ArgoCD Application (GitOps)
+  # ---------------------------------------------------------------------------
+  # The app is deployed BY ArgoCD, not by the pipeline: this job re-applies the
+  # 10-argocd layer with the freshly built image + resolved backing-service
+  # endpoints (as Helm parameters), which declares an ArgoCD Application that
+  # renders charts/sample-app and syncs it (auto-sync + self-heal). The app then
+  # shows up as a first-class Application in the ArgoCD UI. This job then waits
+  # for ArgoCD to provision the ALB, associates the WAF (Auto Mode's native ALB
+  # controller ignores the wafv2-acl-arn annotation, so we associate it via the
+  # API), points DNS at it, and prints the URL. Needs the cluster (eks), the
+  # ArgoCD control plane (argocd), the pushed image (build-sample) and the
+  # backing services (aurora, cache, waf).
+  # ---------------------------------------------------------------------------
+  deploy-sample:
+    name: Deploy Sample App (ArgoCD)
+    runs-on: [self-hosted, eb]
+    timeout-minutes: 35
+    needs: [resolve-backend, eks, argocd, build-sample, aurora, cache, github-runner]
+    if: always() && !failure() && !cancelled()
+    outputs:
+      url: ${{ steps.url.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: deploy-sample-${{ env.ENVIRONMENT }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Resolve cluster + backing-service endpoints from Terraform state
+        id: tf
+        env:
+          BUCKET: ${{ needs.resolve-backend.outputs.state_bucket }}
+          TABLE: ${{ needs.resolve-backend.outputs.lock_table }}
+        run: |
+          tfout() {
+            terraform -chdir="modules/$1" init -reconfigure \
+              -backend-config="backend/config.${{ env.ENVIRONMENT }}.hcl" \
+              -backend-config="bucket=$BUCKET" \
+              -backend-config="dynamodb_table=$TABLE" >/dev/null
+            terraform -chdir="modules/$1" output -raw "$2"
+          }
+          {
+            echo "cluster=$(tfout 04-eks cluster_id)"
+            echo "db=$(tfout 06-aurora cluster_endpoint)"
+            echo "redis=$(tfout 07-cache cluster_address)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --region "${{ env.AWS_REGION }}" --name "${{ steps.tf.outputs.cluster }}"
+      - name: Resolve custom domain + ACM certificate
+        id: domain
+        run: |
+          # The EKS app is the BACKEND API now — the UI host (<APP_SUBDOMAIN>) is
+          # served by CloudFront. The API lives at <APP_SUBDOMAIN>-api.<zone>.
+          HOST="${APP_SUBDOMAIN}-api.${HOSTED_ZONE}"
+          # ACM cert (us-east-1) covering the zone: prefer the wildcard, else the apex.
+          CERT_ARN=$(aws acm list-certificates --region "${AWS_REGION}" \
+            --certificate-statuses ISSUED \
+            --query "CertificateSummaryList[?DomainName=='*.${HOSTED_ZONE}' || DomainName=='${HOSTED_ZONE}'].CertificateArn | [0]" \
+            --output text 2>/dev/null || true)
+          [ "$CERT_ARN" = "None" ] && CERT_ARN=""
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+          echo "cert=$CERT_ARN" >> "$GITHUB_OUTPUT"
+          if [ -n "$CERT_ARN" ]; then
+            echo "custom domain: https://$HOST  (cert: $CERT_ARN)"
+          else
+            echo "no ACM cert for *.${HOSTED_ZONE} — falling back to plain HTTP on the raw ALB DNS"
+          fi
+      - name: Declare + sync the ArgoCD Application (terraform apply 10-argocd)
+        working-directory: modules/10-argocd
+        env:
+          BUCKET: ${{ needs.resolve-backend.outputs.state_bucket }}
+          TABLE: ${{ needs.resolve-backend.outputs.lock_table }}
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          # App values injected as Helm parameters on the ArgoCD Application.
+          TF_VAR_app_image: ${{ needs.build-sample.outputs.image }}
+          TF_VAR_app_db_host: ${{ steps.tf.outputs.db }}
+          TF_VAR_app_redis_host: ${{ steps.tf.outputs.redis }}
+          TF_VAR_app_cert_arn: ${{ steps.domain.outputs.cert }}
+          TF_VAR_app_host: ${{ steps.domain.outputs.host }}
+          # ArgoCD UI ingress MUST be re-passed on this second apply of 10-argocd,
+          # else the re-apply would drop it. Same shared ALB + wildcard cert.
+          TF_VAR_expose_argocd: "true"
+          TF_VAR_argocd_host: eksag.${{ env.HOSTED_ZONE }}
+          TF_VAR_argocd_cert_arn: ${{ steps.domain.outputs.cert }}
+          # ArgoCD pulls the chart from THIS repo/branch over HTTPS with the PAT.
+          TF_VAR_app_repo_url: ${{ github.server_url }}/${{ github.repository }}.git
+          TF_VAR_app_target_revision: ${{ github.ref_name }}
+          TF_VAR_app_repo_username: ${{ github.repository_owner }}
+          TF_VAR_app_repo_password: ${{ secrets.GH_RUNNER_PAT }}
+        run: |
+          terraform init -upgrade -reconfigure \
+            -backend-config="backend/config.${{ env.ENVIRONMENT }}.hcl" \
+            -backend-config="bucket=$BUCKET" \
+            -backend-config="dynamodb_table=$TABLE"
+          # Re-applies the control plane (idempotent) and adds/updates the
+          # sample-app Application with the new image + endpoints.
+          terraform apply -auto-approve -var-file=tfvars/${{ env.ENVIRONMENT }}.tfvars
+      - name: Wait for ArgoCD sync + ALB, point DNS, print URL
+        id: url
+        env:
+          CERT_ARN: ${{ steps.domain.outputs.cert }}
+          HOST: ${{ steps.domain.outputs.host }}
+        run: |
+          # Nudge ArgoCD to reconcile immediately instead of waiting for its
+          # poll interval (the Application already has automated sync enabled).
+          kubectl -n argocd annotate application sample-app \
+            argocd.argoproj.io/refresh=hard --overwrite >/dev/null 2>&1 || true
+
+          # Wait for ArgoCD to sync the chart and the native ALB controller to
+          # provision the ALB (Ingress gets a hostname).
+          ALB=""
+          for i in $(seq 1 60); do
+            ALB=$(kubectl get ingress sample-app -n sample-app \
+              -o jsonpath="{.status.loadBalancer.ingress[0].hostname}" 2>/dev/null || true)
+            [ -n "$ALB" ] && break
+            echo "waiting for ArgoCD to sync the app + provision the ALB... ($i)"; sleep 15
+          done
+
+          if [ -n "$ALB" ] && [ -n "$CERT_ARN" ]; then
+            # Custom domain: UPSERT a CNAME  <HOST> -> <ALB DNS>  in the hosted zone.
+            ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "${HOSTED_ZONE}" \
+              --query "HostedZones[?Name=='${HOSTED_ZONE}.'].Id | [0]" --output text 2>/dev/null | sed 's#/hostedzone/##')
+            if [ -n "$ZONE_ID" ] && [ "$ZONE_ID" != "None" ]; then
+              cat > /tmp/rr.json <<EOF
+          {"Comment":"sample-app","Changes":[{"Action":"UPSERT","ResourceRecordSet":{"Name":"${HOST}","Type":"CNAME","TTL":300,"ResourceRecords":[{"Value":"${ALB}"}]}}]}
+          EOF
+              aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" --change-batch file:///tmp/rr.json >/dev/null
+              echo "DNS: ${HOST} CNAME -> ${ALB} (zone ${ZONE_ID})"
+              FINAL="https://${HOST}"
+            else
+              echo "hosted zone for ${HOSTED_ZONE} not found — serving on raw ALB DNS"
+              FINAL="https://${ALB}"
+            fi
+          elif [ -n "$ALB" ]; then
+            FINAL="http://${ALB}"
+          fi
+
+          echo "url=$FINAL" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Backend API deployed (via ArgoCD)"
+            echo "The EKS app (backend API) is managed by ArgoCD as Application \`sample-app\` — visible in the ArgoCD UI. The public UI is served separately by CloudFront + S3."
+            if [ -n "$FINAL" ]; then
+              echo "**API URL:** $FINAL  (allow ~1-2 min for the ALB targets to become healthy; DNS may take a moment to propagate)"
+            else
+              echo "ALB hostname not ready yet — check ArgoCD: \`kubectl -n argocd get application sample-app\` and \`kubectl get ingress sample-app -n sample-app\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 17. Summary — per-job status + app URL
+  # ---------------------------------------------------------------------------
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - network
+      - vpn
+      - eks
+      - observability
+      - argocd
+      - ecr
+      - aurora
+      - cache
+      - waf
+      - s3
+      - cloudfront
+      - deploy-frontend
+      - build-sample
+      - deploy-sample
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "## EKS Blueprint — Run Complete"
+            echo ""
+            echo "Environment: \`${{ env.ENVIRONMENT }}\` · Region: \`${{ env.AWS_REGION }}\`"
+            echo ""
+            echo "| Job | Status |"
+            echo "|--------|--------|"
+            echo "| 01-network        | ${{ needs.network.result }} |"
+            echo "| 02-vpn            | ${{ needs.vpn.result }} |"
+            echo "| 04-eks            | ${{ needs.eks.result }} |"
+            echo "| 09-observability  | ${{ needs.observability.result }} |"
+            echo "| 10-argocd         | ${{ needs.argocd.result }} |"
+            echo "| 05-ecr            | ${{ needs.ecr.result }} |"
+            echo "| 06-aurora         | ${{ needs.aurora.result }} |"
+            echo "| 07-cache          | ${{ needs.cache.result }} |"
+            echo "| 08-waf (CloudFront)| ${{ needs.waf.result }} |"
+            echo "| 11-s3             | ${{ needs.s3.result }} |"
+            echo "| 12-cloudfront     | ${{ needs.cloudfront.result }} |"
+            echo "| deploy-frontend   | ${{ needs.deploy-frontend.result }} |"
+            echo "| build-sample      | ${{ needs.build-sample.result }} |"
+            echo "| deploy-sample     | ${{ needs.deploy-sample.result }} |"
+            echo ""
+            echo "**Frontend UI (CloudFront):** https://${{ env.APP_SUBDOMAIN }}.${{ env.HOSTED_ZONE }}"
+            if [ -n "${{ needs.deploy-sample.outputs.url }}" ]; then
+              echo "**Backend API (EKS/ALB):** ${{ needs.deploy-sample.outputs.url }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# (re-indexed for GitHub Actions)

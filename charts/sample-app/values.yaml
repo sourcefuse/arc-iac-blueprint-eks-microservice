@@ -1,0 +1,59 @@
+# Default values for the sample-app chart.
+#
+# The create.yml "deploy-sample" job overrides the deploy-time values via
+# --set-string (they come from Terraform outputs / ACM / WAF and so cannot be
+# baked into the chart):
+#   image.repository / image.tag  <- build-sample (ECR)
+#   env.dbHost                     <- 06-aurora  cluster_endpoint
+#   env.redisHost                  <- 07-cache   cluster_address
+#   ingress.host / ingress.certArn <- custom domain + ACM cert (optional)
+# The WAF Web ACL is attached to the shared ALB declaratively by 08-waf, not via
+# an Ingress annotation (EKS Auto Mode's controller ignores that annotation).
+
+# Override the chart name used in labels (resource names stay "sample-app").
+nameOverride: ""
+
+replicaCount: 1
+
+image:
+  # repository + tag are ALWAYS overridden at deploy time by the pipeline
+  # (deploy-sample: --set-string image.repository=<ECR URL> image.tag=<immutable tag>),
+  # resolved from the build-sample job's pushed image. These defaults only apply
+  # if you run `helm install` by hand without --set — set image.repository then.
+  repository: ""
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Surfaced to the container as the APP_VERSION env var.
+appVersion: "1.0.0"
+
+env:
+  # Aurora PostgreSQL writer endpoint (06-aurora cluster_endpoint).
+  dbHost: ""
+  # ElastiCache Redis primary address (07-cache cluster_address).
+  redisHost: ""
+
+service:
+  port: 80
+  targetPort: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+ingress:
+  enabled: true
+  className: alb
+  # One shared ALB is configured at the IngressClass level (04-eks) in both
+  # compute modes — no per-Ingress group.name needed here.
+  healthcheckPath: /health
+  # Custom domain (e.g. eksbp.arc-poc.link). Empty -> no host rule, served on
+  # the raw ALB DNS name.
+  host: ""
+  # ACM certificate ARN. When set, the ALB listens on HTTPS:443 with an
+  # HTTP->HTTPS redirect; when empty it serves plain HTTP:80.
+  certArn: ""
