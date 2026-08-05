@@ -1,0 +1,23 @@
+sample-app has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Image:   {{ .Values.image.repository }}:{{ .Values.image.tag }}
+DB_HOST: {{ .Values.env.dbHost | default "(unset)" }}
+REDIS:   {{ .Values.env.redisHost | default "(unset)" }}
+
+{{- if .Values.ingress.enabled }}
+
+The Ingress provisions an ALB via the AWS Load Balancer Controller
+(group.name={{ .Values.ingress.groupName }}). Get its hostname with:
+
+  kubectl get ingress sample-app -n {{ .Release.Namespace }} \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+
+{{- if .Values.ingress.host }}
+Then browse: {{ if .Values.ingress.certArn }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}
+{{- else }}
+No custom host set — the app is served on the raw ALB DNS name over {{ if .Values.ingress.certArn }}HTTPS{{ else }}HTTP{{ end }}.
+{{- end }}
+{{- end }}
+
+Check rollout:  kubectl -n {{ .Release.Namespace }} rollout status deploy/sample-app
+Health:         curl http://<alb-or-host>/health

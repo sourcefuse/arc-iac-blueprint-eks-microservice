@@ -1,0 +1,24 @@
+# EKS Auto Mode NodeClass — the "how to build a node" spec (IAM role, disks,
+# which subnets/SGs). Mirrors the production pattern: uses the Auto Mode node
+# role created by 04-eks, the cluster security group, and selects the private
+# subnets by the internal-elb discovery tag that 01-network applies.
+apiVersion: eks.amazonaws.com/v1
+kind: NodeClass
+metadata:
+  name: ${name_prefix}-node-class
+spec:
+  role: ${node_role_name}
+  ephemeralStorage:
+    size: 80Gi
+    iops: 3000
+    throughput: 125
+  networkPolicy: DefaultAllow
+  snatPolicy: Random
+  securityGroupSelectorTerms:
+    - id: ${security_group_id}
+  subnetSelectorTerms:
+    - tags:
+        kubernetes.io/role/internal-elb: "1"
+  tags:
+    Name: ${name_prefix}-auto-node
+    Environment: ${environment}

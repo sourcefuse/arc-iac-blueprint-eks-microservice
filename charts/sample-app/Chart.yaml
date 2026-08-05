@@ -1,0 +1,8 @@
+apiVersion: v2
+name: sample-app
+description: Reference microservice for the ARC EKS blueprint (Node.js → Aurora + Redis, exposed on the shared ALB)
+type: application
+# Chart version — bump on chart template changes.
+version: 0.1.0
+# Application version — the sample app's own version (also surfaced as APP_VERSION).
+appVersion: "1.0.0"

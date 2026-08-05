@@ -1,0 +1,24 @@
+# EKS Auto Mode ALB IngressClassParams.
+#
+# ALB TOPOLOGY: by default each Ingress gets its OWN ALB. Unlike the classic AWS
+# Load Balancer Controller, Auto Mode's native controller (eks.amazonaws.com/alb)
+# IGNORES the per-Ingress `alb.ingress.kubernetes.io/group.name` annotation, so
+# app + ArgoCD + Grafana currently provision 3 separate ALBs.
+#
+# To merge them into ONE shared ALB (classic-mode topology, ~1/3 the ALB cost),
+# uncomment `group` below — Auto Mode reads the IngressGroup from HERE, not the
+# annotation. All ingresses using IngressClass "alb" then share one ALB
+# (cross-namespace). After uncommenting: re-run the pipeline; the 3 CNAMEs
+# (eksbp/eksag/eksgf) will re-point to the single new shared ALB DNS.
+apiVersion: eks.amazonaws.com/v1
+kind: IngressClassParams
+metadata:
+  name: alb
+spec:
+  scheme: internet-facing
+  # One shared ALB for ALL "alb"-class ingresses (app + ArgoCD + SigNoz).
+  # Auto Mode reads the IngressGroup from HERE, not the per-Ingress annotation.
+  # The shared ALB is tagged ingress.eks.amazonaws.com/stack = <this group name>,
+  # which 08-waf uses to find it and attach the WAF Web ACL.
+  group:
+    name: eksblueprint

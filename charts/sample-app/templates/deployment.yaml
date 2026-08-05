@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  labels:
+    {{- include "sample-app.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # Single-replica dev app: terminate the old pod BEFORE creating the new one so
+  # the rollout never needs a 2nd pod slot. On a capacity-tight node (EKS Auto
+  # Mode enforces a per-node max-pods cap) the default maxSurge:1/maxUnavailable:0
+  # forces a momentary 2nd pod that can't schedule ("Too many pods") until
+  # Karpenter provisions another node — which stalls the rollout. Trading a few
+  # seconds of downtime per redeploy avoids that entirely.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "sample-app.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sample-app.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: sample-app
+          image: "{{ required "image.repository is required — the pipeline sets it via --set-string image.repository=<ECR URL>; pass it if installing by hand" .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          env:
+            - name: APP_VERSION
+              value: "{{ .Values.appVersion }}"
+            - name: DB_HOST
+              value: "{{ .Values.env.dbHost }}"
+            - name: REDIS_HOST
+              value: "{{ .Values.env.redisHost }}"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
